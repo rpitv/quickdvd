@@ -1,0 +1,16 @@
+{
+	"production_title": "Your Title Here",
+	"production_date": "2011 September 1",
+	"chapter_names": [
+		"Chapter 1 Title Here",
+		"Chapter 2 Title Here",
+		"Chapter 3 Title Here"
+	],
+	"chapter_files": [
+		"/path/to/chapter1.mov",
+		"/path/to/chapter2.mov",
+		"/path/to/chapter3.mov"
+	], 
+	"background_image": "path/to/background.jpg",
+	"photo_credit": "Test Photo Credit"
+}

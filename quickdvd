@@ -1,0 +1,250 @@
+#!/usr/bin/env ruby
+
+# Dependencies: 
+# nokogiri (gem install nokogiri)
+# dvdauthor (apt-get install dvdauthor)
+# ffmpeg (build from source)
+# genisoimage
+# rsvg-convert (apt-get install librsvg2-bin)
+
+require 'json'
+require 'nokogiri'
+require 'tmpdir'
+require 'date'
+
+# Locations of various tools we'll use, and our build location.
+SCRATCH_DIR="/mnt/rpitv-btrfs02/dvd_build"
+FFMPEG="/home/armena/ffmpeg/ffmpeg"
+FFPROBE="/home/armena/ffmpeg/ffprobe"
+
+# The SVG template to use for menu creation, 
+# and the number of chapter buttons it contains.
+
+# FIXME: make this a path relative to the location of this file
+TEMPLATE = "dvd_menu_template_plain.svg"
+CHAPTERS_IN_TEMPLATE = 5
+
+# The config file is a JSON file with the following fields:
+# {
+#	// Main title to show on the menu screen.
+#	"production_title": "Hockey vs. St. Lawrence"
+#
+#	// Production date to show on the menu screen.
+#	"production_date": "2011 November 10"
+#
+#	// An array of video file names, one per chapter.
+#	// These will be passed through ffmpeg, so it doesn't matter
+#	// if they are all different formats.
+#	"chapter_files": [ "/path/to/chapter1.avi", "/path/to/chapter2.mp4", ... ]
+#
+#	// Descriptive chapter names to show on the menu.
+#	// The buttons are small so make sure these are not too long!
+#	"chapter_names": [ "Pregame", "1st Period", ... ]
+#
+#	// Background image for the menu. Dark backgrounds work better
+#	// with the provided template. Should be 16x9 aspect ratio.
+#	"background_image": "/path/to/background.jpg"
+#
+#	// Optional photo credit - omit if not needed.
+#	"photo_credit": "Ben Vreeland"
+# }
+
+# Create the menu background and highlight SVGs from a template.
+def create_menu_images(config, tmpdir)
+	# load the template into Nokogiri
+	svgdoc = File.open(TEMPLATE, "r") { |f| Nokogiri::XML(f) }
+
+	# set chapter titles, remove unused chapter buttons
+	CHAPTERS_IN_TEMPLATE.times do |i|
+		if i < config["chapter_files"].length
+			name = config["chapter_names"][i]
+			svgdoc.at_css("#chapter#{i+1}Button flowPara").content = name
+		else
+			svgdoc.at_css("#chapter#{i+1}Highlight").remove
+			svgdoc.at_css("#chapter#{i+1}Button").remove
+		end
+	end
+
+	# set photo credit or remove if we don't have one
+	if config["photo_credit"]
+		photoCredit = "Photo Credit: " + config["photo_credit"]
+		svgdoc.at_css("#photoCreditText flowPara").content = photoCredit
+	else
+		svgdoc.at_css("#photoCreditText").remove
+	end
+
+	# set production title
+	svgdoc.at_css("#titleText flowPara").content = config["production_title"]
+
+	# set production date
+	svgdoc.at_css("#productionDate flowPara").content = config["production_date"]
+
+	# set copyright date (using inner_html to get the entity)
+	year = Date.parse(config["production_date"]).year
+	svgdoc.at_css("#copyrightText flowPara").inner_html = 
+		"Copyright &#x00A9 #{year} RPI TV"
+
+	# set background image
+	puts svgdoc.at_css("image").attributes.inspect
+	svgdoc.at_css("image").attributes["href"].value = 
+		"file://" + File.realpath(config["background_image"])
+
+	# clone, remove background layer, thus leaving only highlight
+	highlight = svgdoc.clone
+	highlight.at_css("#baseLayer")["opacity"] = "0"
+	highlightSvgFile = File.join(tmpdir, "highlight.svg")
+	IO.write(highlightSvgFile, highlight.to_s)
+
+	# clone, remove highlight layer, keep only background
+	background = svgdoc.clone
+	background.at_css("#highlightLayer").remove
+	backgroundSvgFile = File.join(tmpdir, "background.svg")
+	IO.write(backgroundSvgFile, background.to_s)
+
+	# convert highlight and background to png
+	# the -density argument is the dpi scale to use 
+	# for rasterizing the svg
+
+	backgroundPngFile = File.join(tmpdir, "background.png")
+	system(
+		"inkscape", "-z", "-e", backgroundPngFile, 
+		"-w", "854", "-h", "480", "-C", backgroundSvgFile
+	)
+
+	highlightPngFile = File.join(tmpdir, "highlight.png")
+	system(
+		"inkscape", "-z", "-e", highlightPngFile,
+		"-w", "720", "-h", "480", "-C", highlightSvgFile
+	)
+
+	# run the highlight file through pngquant
+	# this produces highlight-fs8.png
+	highlightQuantPngFile = File.join(tmpdir, "highlight-fs8.png")
+	system("pngquant", "4", highlightPngFile)
+
+	# run the background through ffmpeg to create a .mpg file
+	backgroundMpgFile = File.join(tmpdir, "menu_bkgd.mpg")
+	system(
+		"ffmpeg", "-loop", "1", "-i", backgroundPngFile, 
+		"-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "/dev/zero",
+		"-target", "ntsc-dvd", "-vframes", "30", backgroundMpgFile
+	)
+
+	# create the control file for spumux
+	spumuxXmlFile = File.join(tmpdir, "spumux.xml")
+	spumuxXmlData = <<EOF
+<subpictures>
+	<stream>
+		<spu
+			force="yes"
+			start="00:00:00.00"
+			highlight="#{highlightQuantPngFile}"
+			autooutline="infer"
+			autoorder="rows"
+		/>
+	</stream>
+</subpictures>
+EOF
+	# use spumux to create the mpg file
+	menuMpgFile = File.join(tmpdir, "menu_mux.xml")
+	IO.write(spumuxXmlFile, spumuxXmlData)
+	system("spumux \"#{spumuxXmlFile}\" < \"#{backgroundMpgFile}\" > \"#{menuMpgFile}\"")
+
+	menuMpgFile
+end
+
+# Read production information file.
+config = JSON.parse(IO.read(ARGV[0]))
+
+# Check that the configuration is vaguely sane.
+if config["chapter_files"].length != config["chapter_names"].length
+	fail "Number of chapter files doesn't match number of chapter names"
+end
+
+# This should normally be set to zero.
+# Setting to 1 means that the intermediate files get left behind.
+# Useful for debugging purposes, not so good for production use.
+DEBUG_MODE = 0
+
+# create a temporary directory to encode into
+tmpdir = Dir.mktmpdir(nil, SCRATCH_DIR)
+# make sure to clean it up when we're done
+at_exit do
+	if DEBUG_MODE == 0
+		FileUtils.rm_rf(tmpdir, :secure => true)
+	end
+end
+
+menumuxfile = create_menu_images(config, tmpdir)
+
+# We'll make each file a separate chapter. Easy enough.
+vobs = ""
+n_chapters = 0
+config["chapter_files"].each do |file|
+	# create the output file name
+	outfile = File.join(tmpdir, "chapter_#{n_chapters+1}.mpg")
+
+	# encode to DVD-compatible format
+	system("ffmpeg", "-i", file, "-target", "ntsc-dvd", outfile)
+
+	# add to the list of vobs
+	vobs += "<vob file=\"#{outfile}\" />"
+	n_chapters += 1
+end
+
+# Generate button actions.
+buttons = ""
+n_chapters.times do |i|
+	buttons += "<button>jump title 1 chapter #{i+1};</button>"
+end
+
+# action for the "play all" button
+buttons += "<button>jump title 1 chapter 1;</button>"
+
+
+# Render the background as a PNG, then convert to a mpg
+
+# Render the highlights, pngquant to 4 colors, then run spumux.
+# This creates a mpg with the menu "subtitles" multiplexed in.
+# (see spumux xml in test_dvd folder)
+
+# Create the dvdauthor xml file.
+xmlfile = File.join(tmpdir, "dvdauthor.xml")
+xmlcontents = <<EOF
+<dvdauthor>
+	<vmgm />
+	<titleset>
+		<menus>
+			<pgc entry="root">
+				<vob file="#{menumuxfile}" />
+				#{buttons}
+			</pgc>
+		</menus>
+		<titles>
+			<video format="ntsc" aspect="16:9" />
+			<pgc>
+				#{vobs}
+				<post>call vmgm menu;</post>
+			</pgc>
+		</titles>
+	</titleset>
+</dvdauthor>
+EOF
+IO.write(xmlfile, xmlcontents)
+
+# Run dvdauthor to create the DVD filesystem.
+dvddir = File.join(tmpdir, "dvd")
+ENV["VIDEO_FORMAT"] = "NTSC"
+system("dvdauthor", "-o", dvddir, "-x", xmlfile)
+
+# Run genisoimage to create the ISO file
+# something like genisoimage -v -o isofile -dvd-video dvddir
+if ARGV[0] =~ /\.json$/
+	isofile = ARGV[0].gsub(/\.json$/, '.iso')
+	volume_id = ARGV[0].gsub(/\.json$/, '')
+else
+	isofile = ARGV[0] + '.iso'
+	volume_id = ARGV[0]
+end
+
+system("genisoimage", "-V", volume_id, "-v", "-o", isofile, "-dvd-video", dvddir)
