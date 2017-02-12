@@ -13,7 +13,7 @@ require 'tmpdir'
 require 'date'
 
 # Locations of various tools we'll use, and our build location.
-SCRATCH_DIR="/mnt/rpitv-btrfs02/dvd_build"
+SCRATCH_DIR="/tv/scratch/dvd_isos/dvd_build"
 FFMPEG="/home/armena/ffmpeg/ffmpeg"
 FFPROBE="/home/armena/ffmpeg/ffprobe"
 
