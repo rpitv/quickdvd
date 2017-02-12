@@ -247,4 +247,6 @@ else
 	volume_id = ARGV[0]
 end
 
+volume_id = volume_id[0..31]
+
 system("genisoimage", "-V", volume_id, "-v", "-o", isofile, "-dvd-video", dvddir)
